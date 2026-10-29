@@ -30,3 +30,9 @@ Extraia o ZIP e abra `index.html` no navegador. A leitura de arquivos Excel prec
 - `index.html` o app inteiro
 - `manifest.webmanifest`, `icon-*.png` instalação como app
 - `sw.js` funcionamento offline
+
+## Cotações ao vivo
+
+O app busca preços sozinho: ações, FIIs, ETFs e BDRs pela brapi, cripto pela CoinGecko e o dólar pela AwesomeAPI. Atualiza ao abrir e a cada 15 minutos durante o pregão.
+Para todos os ativos, crie um token gratuito em https://brapi.dev/dashboard e cole na aba Importar. O plano gratuito tem atraso de cerca de 30 minutos e 15 mil consultas por mês.
+Preços de renda fixa, Caixinhas e ativos no exterior continuam manuais.

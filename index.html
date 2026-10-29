@@ -95,6 +95,9 @@ nav.tabs svg{width:22px;height:22px}
 .acts .btn{flex:1}
 .month{font-size:12px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin:12px 0 2px}
 svg text{fill:var(--muted);font-family:var(--f-body)}
+.qline{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:-2px 0 10px;font-size:12px;color:var(--muted)}
+textarea{width:100%;background:var(--surface);color:var(--fg);border:1px solid var(--line);border-radius:10px;padding:10px 12px;font:inherit;font-size:14px;min-height:96px}
+a{color:var(--accent)}
 @media (prefers-reduced-motion:no-preference){.fill{transition:width .3s}}
 </style>
 </head><body>
@@ -224,8 +227,10 @@ if(/fundo/.test(h))return 'Fundos';
 if(/acoes/.test(h))return 'Ações';
 return 'Outros';
 }
-function parseSheet(rows,sheetName,src,cur){
+function autoSrc(name,keys){var n=norm(name);if(/nubank|nuinvest|nu invest/.test(n))return 'Nubank';if(/nomad/.test(n))return 'Nomad';if(keys.indexOf('codigo de negociacao')>=0||keys.some(function(k){return k.indexOf('entrada')===0})||keys.indexOf('escriturador')>=0)return 'B3';return 'Outra'}
+function parseSheet(rows,sheetName,src,cur,fname){
 var res={pos:[],moves:[]},t=toObjs(rows),keys=t.keys;if(!keys.length)return res;
+if(src==='auto')src=autoSrc(fname||'',keys);
 var has=function(f){return keys.some(f)};
 var isMove=has(function(k){return k==="data"})&&has(function(k){return k==='movimentacao'||k==='tipo'||k.indexOf('entrada')===0||k==='tipo de movimentacao'});
 var isPos=!isMove&&has(function(k){return k.indexOf('quantidade')>=0})&&has(function(k){return k.indexOf('valor')>=0||k.indexOf('preco')>=0||k.indexOf('cotacao')>=0||k==='saldo'});
@@ -291,22 +296,85 @@ if(q>0&&Math.abs(q-p.qty)<=Math.max(.5,.01*p.qty)){p.cost=c;p.costAuto=true}
 });
 }
 async function importFiles(files,src,cur){
-var np=0,nm=0,seen=false,bag=[];
+var bag=[];
 for(var i=0;i<files.length;i++){
 var sheets=await readFile(files[i]);
-sheets.forEach(function(s){var r=parseSheet(s.rows,s.name,src,cur);bag.push(r)});
+sheets.forEach(function(s){bag.push(parseSheet(s.rows,s.name,src,cur,files[i].name))});
 }
-var pos=[],moves=[];bag.forEach(function(r){pos=pos.concat(r.pos);moves=moves.concat(r.moves)});
+var pos=[],moves=[],srcs={};
+bag.forEach(function(r){pos=pos.concat(r.pos);moves=moves.concat(r.moves);r.pos.concat(r.moves).forEach(function(x){srcs[x.src]=1})});
 if(!pos.length&&!moves.length)throw new Error('Não encontrei posições nem movimentações. Confira as colunas do modelo abaixo.');
 clearDemo();
-if(pos.length){S.positions=S.positions.filter(function(p){return p.src!==src}).concat(pos);np=pos.length}
+var np=0,nm=0;
+Object.keys(srcs).forEach(function(sc){var ps=pos.filter(function(p){return p.src===sc});if(ps.length){S.positions=S.positions.filter(function(p){return p.src!==sc}).concat(ps);np+=ps.length}});
 if(moves.length){
 var key=function(m){return [m.date,m.type,m.tk,m.inst,m.qty,m.value].join('|')},have={};
 S.moves.forEach(function(m){have[key(m)]=1});
 moves.forEach(function(m){if(!have[key(m)]){have[key(m)]=1;S.moves.push(m);nm++}});
 }
-recalcCosts(src);snapshot();save();
-return src+': '+np+' posições, '+nm+' movimentações novas';
+Object.keys(srcs).forEach(recalcCosts);snapshot();save();
+return Object.keys(srcs).join(' + ')+': '+np+' posições, '+nm+' movimentações novas';
+}
+/* cotações ao vivo */
+var QK='carteira-q-v1';
+var Q=(function(){try{return JSON.parse(localStorage.getItem(QK))||{}}catch(e){return{}}})();
+function qsave(){try{localStorage.setItem(QK,JSON.stringify(Q))}catch(e){}}
+function qcount(n){var m=new Date().toISOString().slice(0,7);if(Q.month!==m){Q.month=m;Q.count=0}Q.count=(Q.count||0)+n}
+function marketOpen(){var d=new Date(Date.now()-3*3600e3),wd=d.getUTCDay(),h=d.getUTCHours()+d.getUTCMinutes()/60;return wd>0&&wd<6&&h>=10&&h<18.5}
+function getJ(url){var c=new AbortController(),t=setTimeout(function(){c.abort()},12000);return fetch(url,{signal:c.signal}).then(function(r){clearTimeout(t);if(!r.ok){var e=new Error('HTTP '+r.status);e.status=r.status;throw e}return r.json()})}
+var CG={BTC:'bitcoin',ETH:'ethereum',SOL:'solana',ADA:'cardano',XRP:'ripple',USDT:'tether',BNB:'binancecoin',DOGE:'dogecoin'};
+var busy=false;
+function hhmm(ms){var d=new Date(ms);return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')}
+function qLine(){return Q.at?'Cotações às '+hhmm(Q.at)+' · atraso de cerca de 30 min':'Cotações ainda não atualizadas'}
+function setQ(msg){var el=document.getElementById('qs');if(el)el.textContent=msg}
+async function refreshQuotes(manual){
+if(busy)return;
+if(S.demo){if(manual)toast('Importe ou adicione seus ativos para buscar cotações.');return}
+if(!S.positions.length)return;
+if(!manual&&Q.at&&Date.now()-Q.at<10*60e3)return;
+busy=true;setQ('Atualizando cotações...');
+var upd=0,fail=0,needTok=0,tks={};
+S.positions.forEach(function(p){if(p.cur==='BRL'&&/^[A-Z]{4}\d{1,2}$/.test(p.tk))tks[p.tk]=1});
+var doB3=manual||marketOpen()||!Q.lastB3;
+if(doB3){
+var list=Object.keys(tks);
+for(var i=0;i<list.length;i++){
+var tk=list[i];
+if((Q.count||0)>=14000){toast('Limite mensal de consultas quase atingido. Cotações pausadas.');break}
+try{
+var tkn=Q.token?'?token='+encodeURIComponent(Q.token):'';
+var j=await getJ('https://brapi.dev/api/quote/'+tk+tkn);qcount(1);
+var r=j&&j.results&&j.results[0];
+if(r&&typeof r.regularMarketPrice==='number'){
+S.positions.forEach(function(p){if(p.tk===tk&&p.cur==='BRL'){p.price=r.regularMarketPrice;p.prev=r.regularMarketPreviousClose;p.value=p.qty*p.price}});upd++;
+}else fail++;
+}catch(e){if(e.status===401||e.status===402||e.status===403||e.status===400)needTok++;else{fail++;if(e.status===429)break}}
+await new Promise(function(ok){setTimeout(ok,300)});
+}
+Q.lastB3=Date.now();
+}
+var ids=[];S.positions.forEach(function(p){if(CG[p.tk]&&ids.indexOf(CG[p.tk])<0)ids.push(CG[p.tk])});
+if(ids.length){try{var c=await getJ('https://api.coingecko.com/api/v3/simple/price?ids='+ids.join(',')+'&vs_currencies=brl');S.positions.forEach(function(p){var id=CG[p.tk];if(id&&c[id]&&c[id].brl){p.price=c[id].brl;p.value=p.qty*p.price;upd++}})}catch(e){fail++}}
+if(S.positions.some(function(p){return p.cur==='USD'})){try{var u=await getJ('https://economia.awesomeapi.com.br/json/last/USD-BRL');var bid=parseFloat(u.USDBRL.bid);if(bid>0)S.usd=bid}catch(e){}}
+Q.at=Date.now();snapshot();save();qsave();busy=false;
+var ae=document.activeElement,typing=ae&&/^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName);
+if(!ui.edit&&!typing)render();else setQ(qLine());
+var nop=S.positions.filter(function(p){return !(p.price>0)}).length;
+if(manual||needTok||nop){toast(upd+' cotações atualizadas'+(needTok?'. '+needTok+' precisam do token da brapi (aba Importar)':'')+(fail?'. '+fail+' falharam':'')+(nop?'. '+nop+' sem preço: toque no ativo para informar':''))}
+}
+function quickAdd(){
+var inst=(document.getElementById('qinst').value||'').trim()||'Minha corretora',n=0;
+document.getElementById('qtext').value.split(/\r?\n/).forEach(function(l){
+var t=l.trim().split(/[\s;]+/).filter(Boolean);if(t.length<2)return;
+var tk=t[0].toUpperCase(),qty=num(t[1]),avg=t.length>2?num(t[2]):NaN;
+if(isNaN(qty)||qty<=0)return;
+clearDemo();
+var p=S.positions.filter(function(x){return x.tk===tk&&x.inst===inst})[0];
+if(!p){p={id:uid(),src:'Outra',inst:inst,tk:tk,name:tk,cls:classify(tk,tk,'','BRL'),qty:qty,price:0,value:0,cost:null,cur:'BRL'};S.positions.push(p)}
+p.qty=qty;p.value=p.qty*p.price;if(!isNaN(avg))p.cost=avg*qty;n++;
+});
+if(!n){toast('Digite uma linha por ativo, como: PETR4 200');return}
+document.getElementById('qtext').value='';save();render();toast(n+' ativos adicionados. Buscando cotações...');refreshQuotes(true);
 }
 function lineChart(pts){
 if(pts.length<2)return '<p class="empty">A evolução aparece a partir da segunda atualização. Importe de novo depois de alguns dias.</p>';
@@ -342,7 +410,8 @@ var t=total(),cost=0,val=0;
 S.positions.forEach(function(p){var c=costBrl(p);if(c!=null){cost+=c;val+=brl(p)}});
 var yr=new Date();yr.setMonth(yr.getMonth()-12);var lim=yr.toISOString().slice(0,10),prov=0;
 S.moves.forEach(function(m){if(m.type==='provento'&&m.date>=lim)prov+=m.value});
-return{t:t,cost:cost,val:val,gain:val-cost,hasCost:cost>0,prov:prov};
+var day=0,dayHas=false;S.positions.forEach(function(p){if(p.cur==='BRL'&&p.prev>0&&p.price>0){day+=p.qty*(p.price-p.prev);dayHas=true}});
+return{t:t,cost:cost,val:val,gain:val-cost,hasCost:cost>0,prov:prov,day:day,dayHas:dayHas};
 }
 function grp(keyFn){var m={};S.positions.forEach(function(p){var k=keyFn(p);m[k]=(m[k]||0)+brl(p)});return Object.keys(m).map(function(k){return{k:k,v:m[k]}}).sort(function(a,b){return b.v-a.v})}
 function vResumo(){
@@ -352,7 +421,7 @@ var prev=S.snaps.length>1?S.snaps[S.snaps.length-2].v:null,ch=prev?(t-prev)/prev
 h+='<div class="hero"><div class="label">Patrimônio total</div><div class="total num">'+money(t)+'</div>'+
 (s.hasCost?'<div class="delta num '+(s.gain>=0?'up':'down')+'">'+(S.hide?'••••':(s.gain>=0?'+':'')+fBRL.format(s.gain))+' · '+pct(s.gain/s.cost*100)+' <span class="note" style="font-weight:400">sobre o custo</span></div>':'<div class="note">Informe o preço médio para ver o resultado</div>')+'</div>';
 h+='<div class="stats"><div class="panel"><div class="label">Proventos 12 meses</div><div class="stat-v num">'+money(s.prov)+'</div></div>'+
-'<div class="panel"><div class="label">Desde a última foto</div><div class="stat-v num '+(ch==null?'':ch>=0?'up':'down')+'">'+(ch==null?'—':pct(ch))+'</div></div></div>';
+(s.dayHas?'<div class="panel"><div class="label">Hoje</div><div class="stat-v num '+(s.day>=0?'up':'down')+'">'+(S.hide?'R$ ••••':(s.day>=0?'+':'')+fBRL.format(s.day))+'</div></div></div>':'<div class="panel"><div class="label">Desde a última foto</div><div class="stat-v num '+(ch==null?'':ch>=0?'up':'down')+'">'+(ch==null?'—':pct(ch))+'</div></div></div>');
 h+='<div class="panel"><h2>Evolução</h2>'+lineChart(S.snaps)+'</div>';
 var byc=grp(function(p){return p.cls}).map(function(x){x.color=clsColor(x.k);return x});
 h+='<div class="panel"><h2>Por classe</h2><div class="donutwrap">'+donut(byc,t)+'<div class="legend">'+byc.map(function(x){return '<div class="lg"><i style="background:'+x.color+'"></i>'+esc(x.k)+'<b class="num">'+(x.v/t*100).toFixed(1).replace('.',',')+'%</b></div>'}).join('')+'</div></div></div>';
@@ -397,19 +466,28 @@ return h+'</div>';
 var TPL_POS='ativo;instituicao;classe;quantidade;preco;moeda;preco_medio\nAAPL;Nomad;Exterior;6;230,10;USD;185,00\nCaixinha RDB;Nubank;Renda fixa;1;8500,00;BRL;';
 var TPL_MOV='data;tipo;ativo;instituicao;quantidade;preco;valor\n15/10/2026;dividendo;PETR4;XP;200;;280,00\n08/10/2026;compra;AAPL;Nomad;2;228,50;457,00';
 function vImportar(){
-return '<div class="panel"><h2>Importar arquivos</h2>'+
-'<div class="two"><div class="field"><label for="src">Origem</label><select id="src">'+SRCS.map(function(s){return '<option>'+s+'</option>'}).join('')+'</select></div>'+
+return '<div class="panel"><h2>Adicionar rápido</h2><p class="note">Digite ou cole uma linha por ativo: código, quantidade e, se quiser, o preço médio. Os preços vêm sozinhos.</p>'+
+'<div class="field"><label for="qinst">Corretora ou banco</label><input type="text" id="qinst" placeholder="Ex.: XP, Nubank" value="'+esc(Q.inst||'')+'"></div>'+
+'<div class="field"><label for="qtext">Ativos</label><textarea id="qtext" placeholder="PETR4 200 31,40&#10;HGLG11 40&#10;BTC 0,01"></textarea></div>'+
+'<button class="btn" data-a="quick" style="width:100%">Adicionar e buscar cotações</button></div>'+
+'<div class="panel"><h2>Importar arquivos</h2>'+
+'<p class="note">Escolha os arquivos de uma vez (B3, Nubank, Nomad). O app reconhece sozinho o que é cada um.</p>'+
+'<div class="drop" id="drop"><input type="file" id="file" accept=".xlsx,.xls,.csv,.txt,.json" multiple style="max-width:100%"></div>'+
+'<div class="two"><div class="field"><label for="src">Origem</label><select id="src"><option value="auto">Detectar sozinho</option>'+SRCS.map(function(s){return '<option>'+s+'</option>'}).join('')+'</select></div>'+
 '<div class="field"><label for="cur">Moeda dos valores</label><select id="cur"><option value="BRL">Reais (R$)</option><option value="USD">Dólar (US$)</option></select></div></div>'+
-'<div class="drop" id="drop"><p class="note" style="margin:0 0 10px">Arraste o arquivo ou escolha no aparelho.<br>Aceita .xlsx, .csv e backup .json</p><input type="file" id="file" accept=".xlsx,.xls,.csv,.txt,.json" multiple style="max-width:100%"></div>'+
 '<p class="note">Ao importar posições de uma origem, a posição anterior dessa origem é substituída. Movimentações repetidas são ignoradas.</p></div>'+
-'<div class="panel"><h2>Como pegar cada arquivo</h2>'+
-'<p class="note"><b>B3:</b> no Canal do Investidor, em Extratos, baixe <b>Posição</b> e <b>Movimentação</b> em Excel e importe com origem B3. O app lê todas as abas (ações, fundos, renda fixa, Tesouro).</p>'+
-'<p class="note"><b>Nubank e Nomad:</b> o que passa por corretora aparece na B3. Para o restante (Caixinhas, cripto, conta Nomad em dólar), monte um CSV simples com o modelo abaixo ou adicione o ativo manualmente.</p>'+
+'<div class="panel"><h2>Cotações ao vivo</h2>'+
+'<p class="note">Ações, FIIs, ETFs e BDRs vêm da brapi, cripto da CoinGecko e o dólar da AwesomeAPI. O app atualiza ao abrir e a cada 15 minutos durante o pregão. O plano gratuito da brapi tem atraso de cerca de 30 minutos e 15 mil consultas por mês.</p>'+
+'<div class="field"><label for="tok">Token da brapi (grátis)</label><input type="text" id="tok" placeholder="Cole o token aqui" value="'+esc(Q.token||'')+'" autocomplete="off"></div>'+
+'<p class="note">Sem token, só PETR4, VALE3, ITUB4 e MGLU3 atualizam. <a href="https://brapi.dev/dashboard" target="_blank" rel="noopener">Criar token grátis</a>. O token fica só neste aparelho. Consultas neste mês: '+(Q.count||0)+'.</p>'+
+'<div class="field"><label for="usd">Dólar (R$ por US$)</label><input type="number" id="usd" step="0.01" value="'+S.usd+'"></div>'+
+'<button class="btn ghost" data-a="refresh" style="width:100%">Atualizar cotações agora</button></div>'+
+'<div class="panel"><h2>Como pegar os arquivos</h2>'+
+'<p class="note"><b>B3:</b> entre no <a href="https://www.investidor.b3.com.br/" target="_blank" rel="noopener">Canal do Investidor</a>, abra Extratos e baixe <b>Posição</b> e <b>Movimentação</b> em Excel. O app lê todas as abas (ações, fundos, renda fixa, Tesouro).</p>'+
+'<p class="note"><b>Nubank e Nomad:</b> o que passa por corretora aparece na B3. Para o resto (Caixinhas, cripto, dólar na Nomad), use Adicionar rápido ou um CSV no modelo abaixo.</p>'+
 '<div class="label" style="margin-top:12px">Modelo de posições</div><pre id="t1">'+esc(TPL_POS)+'</pre><button class="btn ghost" data-a="copy" data-v="1">Copiar modelo</button>'+
 '<div class="label" style="margin-top:14px">Modelo de movimentações</div><pre id="t2">'+esc(TPL_MOV)+'</pre><button class="btn ghost" data-a="copy" data-v="2">Copiar modelo</button></div>'+
-'<div class="panel"><h2>Câmbio e cotações</h2><div class="field"><label for="usd">Dólar (R$ por US$)</label><input type="number" id="usd" step="0.01" value="'+S.usd+'"></div>'+
-'<p class="note">As cotações não atualizam sozinhas neste app. Para atualizar um preço, toque no ativo na Carteira, ou importe um arquivo novo.</p></div>'+
-'<div class="panel"><h2>Seus dados</h2><p class="note">Tudo fica salvo só neste navegador, neste aparelho. Nada é enviado a servidor.</p><div class="acts"><button class="btn" data-a="dlbackup">Baixar backup</button><button class="btn ghost" data-a="dlcsv">Baixar carteira (CSV)</button><button class="btn ghost" data-a="backup">Copiar backup</button><button class="btn ghost" data-a="restore">Restaurar backup</button><button class="btn danger" data-a="wipe">Apagar tudo</button></div></div>';
+'<div class="panel"><h2>Seus dados</h2><p class="note">Tudo fica salvo só neste navegador, neste aparelho. Só os códigos dos ativos (e o token) saem para consultar cotações.</p><div class="acts"><button class="btn" data-a="dlbackup">Baixar backup</button><button class="btn ghost" data-a="dlcsv">Baixar carteira (CSV)</button><button class="btn ghost" data-a="backup">Copiar backup</button><button class="btn ghost" data-a="restore">Restaurar backup</button><button class="btn danger" data-a="wipe">Apagar tudo</button></div></div>';
 }
 function sheetEdit(){
 var id=ui.edit;if(!id)return '';
@@ -424,6 +502,7 @@ return '<div class="sheet-bg" data-a="close"><div class="sheet" role="dialog" ar
 }
 function render(){
 var h='<header class="top"><h1>Minha Carteira</h1><button class="iconbtn" data-a="hide" aria-label="Ocultar valores" aria-pressed="'+S.hide+'">'+(S.hide?'Mostrar':'Ocultar')+'</button></header>';
+h+='<div class="qline"><span id="qs">'+(S.demo?'Dados de exemplo':qLine())+'</span><button class="iconbtn" data-a="refresh">Atualizar</button></div>';
 if(S.demo)h+='<div class="banner"><span>Dados de exemplo. Importe seus arquivos para ver a sua carteira.</span><button data-a="go" data-v="importar">Importar</button></div>';
 h+=tab==='resumo'?vResumo():tab==='carteira'?vCarteira():tab==='proventos'?vProventos():vImportar();
 document.getElementById('app').innerHTML=h;
@@ -439,6 +518,8 @@ var el=e.target.closest('[data-a]');if(!el)return;
 var a=el.dataset.a,v=el.dataset.v;
 if(a==='go')go(v);
 else if(a==='hide'){S.hide=!S.hide;save();render()}
+else if(a==='refresh'){refreshQuotes(true)}
+else if(a==='quick'){Q.inst=document.getElementById('qinst').value.trim();qsave();quickAdd()}
 else if(a==='cls'){ui.cls=v;render()}
 else if(a==='mf'){ui.mf=v;render()}
 else if(a==='edit'){ui.edit=el.dataset.id;render()}
@@ -493,6 +574,7 @@ document.addEventListener('input',function(e){
 if(e.target.id==='q'){ui.q=e.target.value;document.getElementById('plist').innerHTML=listPos()}
 });
 document.addEventListener('change',function(e){
+if(e.target.id==='tok'){Q.token=e.target.value.trim();Q.lastB3=0;qsave();toast(Q.token?'Token salvo.':'Token removido.')}
 if(e.target.id==='usd'){var n=parseFloat(e.target.value);if(n>0){S.usd=n;snapshot();save();toast('Câmbio atualizado.')}}
 if(e.target.id==='file'){doImport(e.target.files);e.target.value=''}
 });
@@ -501,13 +583,16 @@ if(!files||!files.length)return;
 var src=document.getElementById('src').value,cur=document.getElementById('cur').value;
 if(/\.json$/i.test(files[0].name)){files[0].text().then(function(t){try{var o=JSON.parse(t);if(!o||!o.positions)throw 0;S=o;save();render();toast('Backup restaurado.')}catch(x){toast('Backup inválido.')}});return}
 toast('Lendo arquivo...');
-importFiles(Array.prototype.slice.call(files),src,cur).then(function(msg){render();toast(msg)}).catch(function(err){toast(err.message||'Erro ao importar.')});
+importFiles(Array.prototype.slice.call(files),src,cur).then(function(msg){render();toast(msg);refreshQuotes(true)}).catch(function(err){toast(err.message||'Erro ao importar.')});
 }
 document.addEventListener('dragover',function(e){var d=document.getElementById('drop');if(d){e.preventDefault();d.classList.add('on')}});
 document.addEventListener('dragleave',function(){var d=document.getElementById('drop');if(d)d.classList.remove('on')});
 document.addEventListener('drop',function(e){var d=document.getElementById('drop');if(d){e.preventDefault();d.classList.remove('on');doImport(e.dataTransfer.files)}});
 window.addEventListener('hashchange',function(){var t=location.hash.slice(1);if(['resumo','carteira','proventos','importar'].indexOf(t)>=0&&t!==tab){tab=t;render()}});
 render();
+setTimeout(function(){refreshQuotes(false)},800);
+document.addEventListener('visibilitychange',function(){if(!document.hidden)refreshQuotes(false)});
+setInterval(function(){if(!document.hidden)refreshQuotes(false)},15*60*1000);
 })();
 </script>
 <script>if("serviceWorker" in navigator)window.addEventListener("load",function(){navigator.serviceWorker.register("sw.js").catch(function(){})});</script>
